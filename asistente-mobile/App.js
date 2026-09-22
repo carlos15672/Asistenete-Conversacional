@@ -1,20 +1,14 @@
-import React, { useState, useRef, useEffect } from 'react';
-import { StyleSheet, Text, View, TouchableOpacity, Animated, StatusBar, Easing, Alert, FlatList, Modal } from 'react-native';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import {
+  StyleSheet, Text, View, TouchableOpacity, Animated, StatusBar,
+  Easing, Alert, FlatList, Modal, Linking, TextInput, KeyboardAvoidingView,
+  Platform, ActivityIndicator, ScrollView,
+} from 'react-native';
 import axios from 'axios';
+import { Audio } from 'expo-av';
+import * as Speech from 'expo-speech';
 import Svg, { Path } from 'react-native-svg';
-
-// Try to import notifee, gracefully fallback if not available in Expo Go
-let notifee, AndroidImportance, AndroidCategory, AndroidVisibility;
-try {
-  notifee = require('@notifee/react-native').default;
-  AndroidImportance = require('@notifee/react-native').AndroidImportance;
-  AndroidCategory = require('@notifee/react-native').AndroidCategory;
-  AndroidVisibility = require('@notifee/react-native').AndroidVisibility;
-} catch (e) {
-  notifee = null;
-}
-
-const API_URL = 'http://192.168.0.11:3000/api'; // Android emulator
+import { getServerUrl, setServerUrl, buildApiUrl, DEFAULT_URL } from './config';
 
 // ===== HELPERS =====
 const getDateString = () => {
@@ -52,39 +46,69 @@ const getIcon = (title) => {
 // ===== MAIN APP =====
 export default function App() {
   const [screen, setScreen] = useState('main'); // main | reminders
-  const [micState, setMicState] = useState('idle');
+  const [micState, setMicState] = useState('idle'); // idle | listening | processing | speaking
   const [showCallModal, setShowCallModal] = useState(false);
   const [showAlert, setShowAlert] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
   const [nextReminder, setNextReminder] = useState(null);
   const [reminders, setReminders] = useState([]);
+  const [aiResponse, setAiResponse] = useState('');
+  const [serverIp, setServerIp] = useState('');
+  const [apiUrl, setApiUrl] = useState(DEFAULT_URL);
+  const [isConnected, setIsConnected] = useState(null); // null = no chequeado, true/false
+
   const pulseAnim = useRef(new Animated.Value(1)).current;
   const waveAnims = useRef([...Array(5)].map(() => new Animated.Value(8))).current;
+  const recordingRef = useRef(null);
 
-  // Setup notifications
+  // ===== LOAD SERVER URL & INITIAL DATA =====
   useEffect(() => {
-    if (notifee) {
-      (async () => {
-        await notifee.requestPermission();
-        await notifee.createChannel({
-          id: 'critical_alarms',
-          name: 'Alarmas Críticas Médicas',
-          importance: AndroidImportance?.HIGH,
-          sound: 'default',
-        });
-      })();
+    (async () => {
+      const url = await getServerUrl();
+      setApiUrl(url);
+      // Extraer IP del URL para mostrar en settings
+      const match = url.match(/http:\/\/(.+):3000/);
+      if (match) setServerIp(match[1]);
+      // Fetch next reminder
+      fetchNextReminder(url);
+      // Check connection
+      checkConnection(url);
+    })();
+  }, []);
+
+  const checkConnection = async (url) => {
+    try {
+      await axios.get(`${url}/reminders/next`, { timeout: 3000 });
+      setIsConnected(true);
+    } catch {
+      setIsConnected(false);
     }
-  }, []);
+  };
 
-  // Fetch next reminder
+  const fetchNextReminder = async (url) => {
+    try {
+      const res = await axios.get(`${url || apiUrl}/reminders/next`, { timeout: 5000 });
+      setNextReminder(res.data || null);
+    } catch {
+      // Sin conexión, no mostrar recordatorio
+    }
+  };
+
+  // ===== REQUEST MICROPHONE PERMISSIONS =====
   useEffect(() => {
-    axios.get(`${API_URL}/reminders/next`)
-      .then(res => { if (res.data) setNextReminder(res.data); })
-      .catch(() => {
-        setNextReminder({ id: 1, title: 'Pastilla para la presión', time: new Date().toISOString(), isCritical: true });
-      });
+    (async () => {
+      const { status } = await Audio.requestPermissionsAsync();
+      if (status !== 'granted') {
+        Alert.alert(
+          'Permiso necesario',
+          'Necesito acceso al micrófono para poder escucharte. Por favor actívalo en los ajustes de tu teléfono.',
+          [{ text: 'Entendido' }]
+        );
+      }
+    })();
   }, []);
 
-  // Pulse animation
+  // ===== PULSE ANIMATION =====
   useEffect(() => {
     Animated.loop(
       Animated.sequence([
@@ -94,7 +118,7 @@ export default function App() {
     ).start();
   }, []);
 
-  // Sound wave animation
+  // ===== SOUND WAVE ANIMATION =====
   useEffect(() => {
     if (micState === 'listening' || micState === 'speaking') {
       waveAnims.forEach((anim, i) => {
@@ -110,68 +134,195 @@ export default function App() {
     }
   }, [micState]);
 
-  const handleMicPress = () => {
-    if (micState !== 'idle') {
-      setMicState('idle'); 
-      return; 
+  // ===== VOICE RECORDING =====
+  const startRecording = async () => {
+    try {
+      // Detener cualquier habla de la IA que esté en curso
+      Speech.stop();
+      setAiResponse('');
+
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: true,
+        playsInSilentModeIOS: true,
+      });
+
+      const { recording } = await Audio.Recording.createAsync({
+        android: {
+          extension: '.m4a',
+          outputFormat: Audio.AndroidOutputFormat.MPEG_4,
+          audioEncoder: Audio.AndroidAudioEncoder.AAC,
+          sampleRate: 44100,
+          numberOfChannels: 1,
+          bitRate: 128000,
+        },
+        ios: {
+          extension: '.m4a',
+          outputFormat: Audio.IOSOutputFormat.MPEG4AAC,
+          audioQuality: Audio.IOSAudioQuality.HIGH,
+          sampleRate: 44100,
+          numberOfChannels: 1,
+          bitRate: 128000,
+        },
+        web: {},
+      });
+
+      recordingRef.current = recording;
+      setMicState('listening');
+    } catch (err) {
+      console.error('Error al iniciar grabación:', err);
+      Alert.alert('Error', 'No se pudo iniciar el micrófono. Verifica que hayas dado permisos.');
     }
-    
-    // Simulación visual en el celular (Opción Híbrida)
-    setMicState('listening');
-    setTimeout(() => {
-      setMicState('speaking');
-      setTimeout(() => {
-        setMicState('idle');
-      }, 2000);
-    }, 4000);
   };
 
+  const stopRecordingAndSend = async () => {
+    if (!recordingRef.current) return;
+
+    setMicState('processing');
+
+    try {
+      await recordingRef.current.stopAndUnloadAsync();
+      await Audio.setAudioModeAsync({ allowsRecordingIOS: false });
+      const uri = recordingRef.current.getURI();
+      recordingRef.current = null;
+
+      if (!uri) {
+        setMicState('idle');
+        return;
+      }
+
+      // Preparar FormData para enviar el audio al backend
+      const formData = new FormData();
+      formData.append('audio', {
+        uri: uri,
+        type: 'audio/m4a',
+        name: 'recording.m4a',
+      });
+
+      const response = await axios.post(`${apiUrl}/voice-command-audio`, formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+        timeout: 15000,
+      });
+
+      const data = response.data;
+      setAiResponse(data.response);
+
+      // Hablar la respuesta con Text-to-Speech
+      setMicState('speaking');
+      Speech.speak(data.response, {
+        language: 'es-MX',
+        rate: 1.0,
+        onDone: () => {
+          setMicState('idle');
+        },
+        onError: () => {
+          setMicState('idle');
+        },
+      });
+
+      // Refrescar el próximo recordatorio
+      fetchNextReminder(apiUrl);
+
+    } catch (err) {
+      console.error('Error al enviar audio:', err);
+      const errorMsg = err.response
+        ? 'Hubo un problema al procesar tu mensaje.'
+        : 'No pude conectar con el servidor. Verifica que el backend esté encendido y la IP sea correcta.';
+
+      setAiResponse(errorMsg);
+      setMicState('speaking');
+      Speech.speak(errorMsg, {
+        language: 'es-MX',
+        rate: 1.0,
+        onDone: () => setMicState('idle'),
+        onError: () => setMicState('idle'),
+      });
+    }
+  };
+
+  const handleMicPress = async () => {
+    if (micState === 'listening') {
+      // Si está escuchando, detener y enviar
+      await stopRecordingAndSend();
+    } else if (micState === 'speaking') {
+      // Si está hablando, interrumpir
+      Speech.stop();
+      setMicState('idle');
+    } else if (micState === 'idle') {
+      // Si está idle, empezar a grabar
+      await startRecording();
+    }
+    // Si está 'processing', no hacer nada (esperar)
+  };
+
+  // ===== MARK COMPLETE =====
   const handleMarkComplete = async () => {
     if (nextReminder) {
-      try { await axios.post(`${API_URL}/reminders/${nextReminder.id}/complete`); } catch (e) {}
-      try {
-        const res = await axios.get(`${API_URL}/reminders/next`);
-        setNextReminder(res.data || null);
-      } catch (e) { setNextReminder(null); }
+      try { await axios.post(`${apiUrl}/reminders/${nextReminder.id}/complete`); } catch {}
+      fetchNextReminder(apiUrl);
     }
   };
 
+  // ===== LOAD REMINDERS =====
   const loadReminders = async () => {
     try {
-      const res = await axios.get(`${API_URL}/reminders`);
+      const res = await axios.get(`${apiUrl}/reminders`, { timeout: 5000 });
       setReminders(res.data);
-    } catch (e) {
-      setReminders([
-        { id: 1, title: 'Pastilla para la presión', time: new Date().toISOString(), isCritical: true, isCompleted: false },
-        { id: 2, title: 'Tomar agua', time: new Date().toISOString(), isCritical: false, isCompleted: false },
-      ]);
+    } catch {
+      setReminders([]);
+      Alert.alert('Sin conexión', 'No se pudieron cargar los recordatorios. Verifica que el servidor esté encendido.');
     }
     setScreen('reminders');
   };
 
-  const triggerAlert = async () => {
-    if (notifee) {
-      await notifee.displayNotification({
-        title: '¡ALERTA MÉDICA!',
-        body: nextReminder?.title || 'Es hora de tomar tu pastilla.',
-        android: {
-          channelId: 'critical_alarms',
-          category: AndroidCategory?.ALARM,
-          importance: AndroidImportance?.HIGH,
-          fullScreenAction: { id: 'default' },
-          pressAction: { id: 'default' },
-        },
-      });
-    }
+  // ===== TRIGGER ALERT =====
+  const triggerAlert = () => {
     setShowAlert(true);
+  };
+
+  // ===== PHONE CALLS =====
+  const makePhoneCall = (phoneNumber) => {
+    setShowCallModal(false);
+    const url = `tel:${phoneNumber.replace(/\s/g, '')}`;
+    Linking.canOpenURL(url).then((supported) => {
+      if (supported) {
+        Linking.openURL(url);
+      } else {
+        Alert.alert('No disponible', 'Tu dispositivo no puede realizar llamadas telefónicas.');
+      }
+    });
+  };
+
+  // ===== SAVE SERVER SETTINGS =====
+  const saveServerSettings = async () => {
+    if (!serverIp.trim()) {
+      Alert.alert('IP vacía', 'Por favor ingresa la IP del servidor.');
+      return;
+    }
+    const newUrl = buildApiUrl(serverIp);
+    await setServerUrl(newUrl);
+    setApiUrl(newUrl);
+    setShowSettings(false);
+
+    // Verificar conexión con la nueva URL
+    setIsConnected(null);
+    try {
+      await axios.get(`${newUrl}/reminders/next`, { timeout: 3000 });
+      setIsConnected(true);
+      fetchNextReminder(newUrl);
+      Alert.alert('✅ Conectado', `Servidor configurado correctamente en ${serverIp}`);
+    } catch {
+      setIsConnected(false);
+      Alert.alert('❌ Sin conexión', `No se pudo conectar a ${serverIp}:3000. Verifica que el servidor esté encendido y estés en la misma red WiFi.`);
+    }
   };
 
   // ===== SCREENS =====
 
+  // ---------- ALERT SCREEN ----------
   if (showAlert) {
     return (
       <View style={styles.alertScreen}>
-        <StatusBar barStyle="dark-content" />
+        <StatusBar barStyle="light-content" backgroundColor="#c0392b" />
         <View style={styles.alertIconCircle}><Text style={{ fontSize: 48 }}>💊</Text></View>
         <Text style={styles.alertTitle}>¡Es hora de {nextReminder?.title || 'tomar tu pastilla'}!</Text>
         <Text style={styles.alertTime}>{nextReminder ? formatTime(nextReminder.time) : '8:00 PM'}</Text>
@@ -182,49 +333,77 @@ export default function App() {
     );
   }
 
+  // ---------- REMINDERS SCREEN ----------
   if (screen === 'reminders') {
     return (
       <View style={styles.remindersScreen}>
-        <StatusBar barStyle="dark-content" />
+        <StatusBar barStyle="dark-content" backgroundColor={COLORS.dominant} />
         <View style={styles.screenHeader}>
           <TouchableOpacity style={styles.backBtn} onPress={() => setScreen('main')}>
             <Text style={{ color: '#0f172a', fontSize: 20 }}>←</Text>
           </TouchableOpacity>
           <Text style={styles.screenTitle}>Mis Recordatorios</Text>
         </View>
-        <FlatList
-          data={reminders}
-          keyExtractor={item => String(item.id)}
-          contentContainerStyle={{ gap: 10, paddingBottom: 20 }}
-          renderItem={({ item }) => (
-            <View style={[styles.reminderItem, item.isCritical && styles.reminderItemCritical, item.isCompleted && { opacity: 0.4 }]}>
-              <Text style={{ fontSize: 28, marginRight: 12 }}>{getIcon(item.title)}</Text>
-              <View style={{ flex: 1 }}>
-                <Text style={styles.reminderItemTitle}>{item.title}</Text>
-                <Text style={styles.reminderItemTime}>{formatTime(item.time)}</Text>
+        {reminders.length === 0 ? (
+          <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}>
+            <Text style={{ fontSize: 48, marginBottom: 12 }}>📋</Text>
+            <Text style={{ color: COLORS.textMuted, fontSize: 17, fontWeight: '600', textAlign: 'center' }}>
+              No tienes recordatorios aún.{'\n'}Dile al asistente que te recuerde algo.
+            </Text>
+          </View>
+        ) : (
+          <FlatList
+            data={reminders}
+            keyExtractor={item => String(item.id)}
+            contentContainerStyle={{ gap: 10, paddingBottom: 20 }}
+            renderItem={({ item }) => (
+              <View style={[styles.reminderItem, item.isCritical && styles.reminderItemCritical, item.isCompleted && { opacity: 0.4 }]}>
+                <Text style={{ fontSize: 28, marginRight: 12 }}>{getIcon(item.title)}</Text>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.reminderItemTitle}>{item.title}</Text>
+                  <Text style={styles.reminderItemTime}>{formatTime(item.time)}</Text>
+                </View>
+                <View style={[styles.badge, item.isCompleted ? styles.badgeDone : item.isCritical ? styles.badgeCritical : styles.badgePending]}>
+                  <Text style={[styles.badgeText, item.isCompleted ? { color: '#22c55e' } : item.isCritical ? { color: '#ef4444' } : { color: '#eab308' }]}>
+                    {item.isCompleted ? 'HECHO' : item.isCritical ? 'CRÍTICO' : 'PENDIENTE'}
+                  </Text>
+                </View>
               </View>
-              <View style={[styles.badge, item.isCompleted ? styles.badgeDone : item.isCritical ? styles.badgeCritical : styles.badgePending]}>
-                <Text style={[styles.badgeText, item.isCompleted ? { color: '#22c55e' } : item.isCritical ? { color: '#ef4444' } : { color: '#eab308' }]}>
-                  {item.isCompleted ? 'HECHO' : item.isCritical ? 'CRÍTICO' : 'PENDIENTE'}
-                </Text>
-              </View>
-            </View>
-          )}
-        />
+            )}
+          />
+        )}
       </View>
     );
   }
 
-  // ===== MAIN SCREEN =====
+  // ---------- MAIN SCREEN ----------
   return (
     <View style={styles.container}>
-      <StatusBar barStyle="dark-content" />
+      <StatusBar barStyle="light-content" backgroundColor={COLORS.secondary} />
 
+      {/* HEADER */}
       <View style={styles.header}>
-        <Text style={styles.dateText}>{getDateString().toUpperCase()}</Text>
-        <Text style={styles.greetingText}>{getGreeting()}</Text>
+        <View style={styles.headerRow}>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.dateText}>{getDateString().toUpperCase()}</Text>
+            <Text style={styles.greetingText}>{getGreeting()}</Text>
+          </View>
+          <TouchableOpacity style={styles.settingsBtn} onPress={() => setShowSettings(true)}>
+            <Text style={{ fontSize: 22 }}>⚙️</Text>
+          </TouchableOpacity>
+        </View>
+        {/* Connection indicator */}
+        {isConnected !== null && (
+          <View style={styles.connectionBadge}>
+            <View style={[styles.connectionDot, { backgroundColor: isConnected ? '#2ECC71' : '#E74C3C' }]} />
+            <Text style={styles.connectionText}>
+              {isConnected ? 'Conectado al servidor' : 'Sin conexión al servidor'}
+            </Text>
+          </View>
+        )}
       </View>
 
+      {/* NEXT REMINDER CARD */}
       {nextReminder && (
         <TouchableOpacity activeOpacity={0.9} onPress={triggerAlert}>
           <View style={styles.reminderCard}>
@@ -238,16 +417,36 @@ export default function App() {
         </TouchableOpacity>
       )}
 
+      {/* MIC AREA */}
       <View style={styles.micContainer}>
         <Text style={styles.instructionText}>
-          {micState === 'listening' ? 'Escuchando en la computadora...' :
-           micState === 'speaking' ? 'Procesando...' :
-           'Activa el micrófono en la PC'}
+          {micState === 'listening' ? '🎙️ Te estoy escuchando...' :
+           micState === 'processing' ? '⏳ Procesando tu mensaje...' :
+           micState === 'speaking' ? '💬 Respondiendo...' :
+           '👇 Toca para hablar'}
         </Text>
-        <TouchableOpacity activeOpacity={0.8} onPress={handleMicPress} style={styles.micButtonContainer}>
+
+        {/* Show AI response text */}
+        {aiResponse ? (
+          <View style={styles.responseContainer}>
+            <Text style={styles.responseText}>💬 {aiResponse}</Text>
+          </View>
+        ) : null}
+
+        <TouchableOpacity activeOpacity={0.8} onPress={handleMicPress} style={styles.micButtonContainer} disabled={micState === 'processing'}>
           {micState === 'idle' && <Animated.View style={[styles.glowLayer, { transform: [{ scale: pulseAnim }] }]} />}
-          <View style={[styles.micButton, micState === 'listening' && styles.micButtonListening, micState === 'speaking' && styles.micButtonSpeaking]}>
-            {micState === 'idle' ? (
+          <View style={[
+            styles.micButton,
+            micState === 'listening' && styles.micButtonListening,
+            micState === 'processing' && styles.micButtonProcessing,
+            micState === 'speaking' && styles.micButtonSpeaking,
+          ]}>
+            {micState === 'processing' ? (
+              <>
+                <ActivityIndicator size="large" color="white" />
+                <Text style={styles.micButtonText}>PROCESANDO</Text>
+              </>
+            ) : micState === 'idle' ? (
               <>
                 <Svg width={40} height={40} viewBox="0 0 24 24" fill="white">
                   <Path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z" />
@@ -262,13 +461,20 @@ export default function App() {
                     <Animated.View key={i} style={[styles.waveBar, { height: anim }]} />
                   ))}
                 </View>
-                <Text style={styles.micButtonText}>{micState === 'listening' ? 'ESCUCHANDO' : 'HABLANDO'}</Text>
+                <Text style={styles.micButtonText}>
+                  {micState === 'listening' ? 'ESCUCHANDO' : 'HABLANDO'}
+                </Text>
               </>
             )}
           </View>
         </TouchableOpacity>
+
+        {micState === 'listening' && (
+          <Text style={styles.micHint}>Toca de nuevo para enviar</Text>
+        )}
       </View>
 
+      {/* QUICK ACTIONS */}
       <View style={[styles.quickActions, { paddingHorizontal: 20 }]}>
         <TouchableOpacity style={[styles.actionBtn, styles.actionBtnDanger, { marginRight: 10 }]} onPress={() => setShowCallModal(true)}>
           <Text style={styles.actionIcon}>📞</Text>
@@ -280,18 +486,18 @@ export default function App() {
         </TouchableOpacity>
       </View>
 
-      {/* Call Modal */}
+      {/* CALL MODAL */}
       <Modal visible={showCallModal} transparent animationType="fade">
         <View style={styles.modalOverlay}>
           <View style={styles.modalCard}>
             <Text style={{ fontSize: 48, textAlign: 'center', marginBottom: 12 }}>📞</Text>
             <Text style={styles.modalTitle}>Llamar a mi familia</Text>
             <Text style={styles.modalSubtitle}>Elige a quién quieres llamar:</Text>
-            <TouchableOpacity style={styles.contactBtn} onPress={() => { setShowCallModal(false); Alert.alert('Llamando...', 'Conectando con Laura'); }}>
+            <TouchableOpacity style={styles.contactBtn} onPress={() => makePhoneCall('+52 614 123 4567')}>
               <View style={styles.contactAvatar}><Text style={{ color: 'white', fontWeight: 'bold', fontSize: 18 }}>L</Text></View>
               <View><Text style={styles.contactName}>Laura (Hija)</Text><Text style={styles.contactPhone}>+52 614 123 4567</Text></View>
             </TouchableOpacity>
-            <TouchableOpacity style={styles.contactBtn} onPress={() => { setShowCallModal(false); Alert.alert('Llamando...', 'Conectando con Carlos'); }}>
+            <TouchableOpacity style={styles.contactBtn} onPress={() => makePhoneCall('+52 614 987 6543')}>
               <View style={styles.contactAvatar}><Text style={{ color: 'white', fontWeight: 'bold', fontSize: 18 }}>C</Text></View>
               <View><Text style={styles.contactName}>Carlos (Hijo)</Text><Text style={styles.contactPhone}>+52 614 987 6543</Text></View>
             </TouchableOpacity>
@@ -301,18 +507,54 @@ export default function App() {
           </View>
         </View>
       </Modal>
+
+      {/* SETTINGS MODAL */}
+      <Modal visible={showSettings} transparent animationType="slide">
+        <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={styles.modalOverlay}>
+          <View style={styles.modalCard}>
+            <Text style={{ fontSize: 40, textAlign: 'center', marginBottom: 8 }}>⚙️</Text>
+            <Text style={styles.modalTitle}>Configuración del Servidor</Text>
+            <Text style={styles.modalSubtitle}>
+              Ingresa la IP de la computadora donde corre el backend (deben estar en la misma red WiFi).
+            </Text>
+
+            <Text style={styles.inputLabel}>Dirección IP del servidor</Text>
+            <TextInput
+              style={styles.textInput}
+              placeholder="Ejemplo: 192.168.0.11"
+              placeholderTextColor={COLORS.textMuted}
+              value={serverIp}
+              onChangeText={setServerIp}
+              keyboardType="numeric"
+              autoCorrect={false}
+            />
+
+            <Text style={styles.settingsHint}>
+              💡 En la computadora abre una terminal y escribe {Platform.OS === 'ios' ? 'ifconfig' : 'ipconfig'} para ver tu IP local.
+            </Text>
+
+            <TouchableOpacity style={styles.saveBtn} onPress={saveServerSettings}>
+              <Text style={styles.saveBtnText}>Guardar y Conectar</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity onPress={() => setShowSettings(false)} style={styles.modalClose}>
+              <Text style={{ color: '#9494b8', fontSize: 16, fontWeight: '600' }}>Cancelar</Text>
+            </TouchableOpacity>
+          </View>
+        </KeyboardAvoidingView>
+      </Modal>
     </View>
   );
 }
 
 // ===== STYLES (70/30/10 Color System) =====
 const COLORS = {
-  dominant: '#F5F0EB',     // 70% - Warm cream
+  dominant: '#F5F0EB',
   card: '#FFFFFF',
-  secondary: '#2B7A78',    // 30% - Calming teal
+  secondary: '#2B7A78',
   secondaryLight: '#3AAFA9',
   secondaryDark: '#17615F',
-  accent: '#E8845C',       // 10% - Warm coral
+  accent: '#E8845C',
   accentLight: '#F0A07A',
   textMain: '#2D3436',
   textSecondary: '#4A6163',
@@ -323,10 +565,12 @@ const COLORS = {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: COLORS.dominant, paddingTop: 0 },
+
+  // Header
   header: {
     backgroundColor: COLORS.secondary,
     paddingTop: 56,
-    paddingBottom: 28,
+    paddingBottom: 20,
     paddingHorizontal: 24,
     borderBottomLeftRadius: 32,
     borderBottomRightRadius: 32,
@@ -336,8 +580,45 @@ const styles = StyleSheet.create({
     shadowRadius: 20,
     elevation: 10,
   },
+  headerRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    justifyContent: 'space-between',
+  },
   dateText: { color: 'rgba(255,255,255,0.7)', fontSize: 13, fontWeight: '700', letterSpacing: 2, marginBottom: 6 },
   greetingText: { color: '#ffffff', fontSize: 34, fontWeight: '800' },
+  settingsBtn: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: 'rgba(255,255,255,0.15)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 4,
+  },
+  connectionBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 10,
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    backgroundColor: 'rgba(255,255,255,0.12)',
+    borderRadius: 20,
+    alignSelf: 'flex-start',
+  },
+  connectionDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    marginRight: 8,
+  },
+  connectionText: {
+    color: 'rgba(255,255,255,0.85)',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+
+  // Reminder Card
   reminderCard: {
     backgroundColor: COLORS.card,
     borderRadius: 20,
@@ -357,8 +638,25 @@ const styles = StyleSheet.create({
   reminderLabel: { color: COLORS.textMuted, fontSize: 11, fontWeight: '800', letterSpacing: 1 },
   reminderTitleText: { color: COLORS.textMain, fontSize: 22, fontWeight: '800', marginBottom: 6 },
   reminderTimeText: { color: COLORS.accent, fontSize: 17, fontWeight: '700' },
+
+  // Mic Area
   micContainer: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 20 },
-  instructionText: { color: COLORS.textSecondary, fontSize: 17, marginBottom: 24, fontWeight: '600' },
+  instructionText: { color: COLORS.textSecondary, fontSize: 17, marginBottom: 12, fontWeight: '600', textAlign: 'center' },
+  responseContainer: {
+    backgroundColor: 'rgba(43, 122, 120, 0.08)',
+    borderRadius: 16,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    marginBottom: 16,
+    maxWidth: '90%',
+  },
+  responseText: {
+    color: COLORS.secondaryDark,
+    fontSize: 15,
+    fontWeight: '600',
+    textAlign: 'center',
+    lineHeight: 22,
+  },
   micButtonContainer: { alignItems: 'center', justifyContent: 'center', width: 180, height: 180 },
   glowLayer: {
     position: 'absolute',
@@ -383,10 +681,20 @@ const styles = StyleSheet.create({
     shadowRadius: 20,
   },
   micButtonListening: { backgroundColor: COLORS.success, borderColor: COLORS.success, shadowColor: COLORS.success },
+  micButtonProcessing: { backgroundColor: '#F39C12', borderColor: '#F39C12', shadowColor: '#F39C12' },
   micButtonSpeaking: { backgroundColor: COLORS.accent, borderColor: COLORS.accent, shadowColor: COLORS.accent },
   micButtonText: { color: '#ffffff', fontSize: 13, fontWeight: '800', letterSpacing: 1.5, marginTop: 6 },
+  micHint: {
+    color: COLORS.textMuted,
+    fontSize: 14,
+    fontWeight: '600',
+    marginTop: 16,
+    fontStyle: 'italic',
+  },
   soundWaves: { flexDirection: 'row', alignItems: 'center', gap: 5, height: 32 },
   waveBar: { width: 5, backgroundColor: 'white', borderRadius: 4 },
+
+  // Quick Actions
   quickActions: {
     flexDirection: 'row',
     justifyContent: 'space-between',
@@ -412,6 +720,7 @@ const styles = StyleSheet.create({
   actionBtnWarning: { borderLeftWidth: 3, borderLeftColor: COLORS.secondary },
   actionIcon: { fontSize: 30, marginBottom: 8 },
   actionText: { fontSize: 14, fontWeight: '700', textAlign: 'center', color: COLORS.textSecondary },
+
   // Alert Screen
   alertScreen: { flex: 1, backgroundColor: '#c0392b', alignItems: 'center', justifyContent: 'center', padding: 24 },
   alertIconCircle: { width: 120, height: 120, borderRadius: 60, backgroundColor: 'rgba(255,255,255,0.95)', alignItems: 'center', justifyContent: 'center', marginBottom: 24 },
@@ -419,37 +728,25 @@ const styles = StyleSheet.create({
   alertTime: { fontSize: 36, color: '#fcd34d', fontWeight: '800', marginBottom: 48 },
   alertConfirm: { width: '100%', maxWidth: 340, padding: 20, borderRadius: 24, backgroundColor: 'white', alignItems: 'center', elevation: 8 },
   alertConfirmText: { fontSize: 24, fontWeight: '800', color: '#b91c1c' },
+
   // Reminders Screen
   remindersScreen: { flex: 1, backgroundColor: COLORS.dominant, padding: 24, paddingTop: 56 },
   screenHeader: { flexDirection: 'row', alignItems: 'center', gap: 12, marginBottom: 24 },
   backBtn: {
-    width: 48,
-    height: 48,
-    borderRadius: 14,
-    backgroundColor: COLORS.card,
-    borderWidth: 0,
-    alignItems: 'center',
-    justifyContent: 'center',
-    elevation: 3,
-    shadowColor: '#000',
+    width: 48, height: 48, borderRadius: 14,
+    backgroundColor: COLORS.card, borderWidth: 0,
+    alignItems: 'center', justifyContent: 'center',
+    elevation: 3, shadowColor: '#000',
     shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.06,
-    shadowRadius: 8,
+    shadowOpacity: 0.06, shadowRadius: 8,
   },
   screenTitle: { fontSize: 24, fontWeight: '800', color: COLORS.secondaryDark },
   reminderItem: {
-    backgroundColor: COLORS.card,
-    borderWidth: 0,
-    borderRadius: 18,
-    padding: 18,
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginBottom: 12,
-    elevation: 3,
-    shadowColor: '#000',
+    backgroundColor: COLORS.card, borderWidth: 0, borderRadius: 18,
+    padding: 18, flexDirection: 'row', alignItems: 'center',
+    marginBottom: 12, elevation: 3, shadowColor: '#000',
     shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.05,
-    shadowRadius: 8,
+    shadowOpacity: 0.05, shadowRadius: 8,
   },
   reminderItemCritical: { borderLeftWidth: 4, borderLeftColor: COLORS.danger },
   reminderItemTitle: { color: COLORS.textMain, fontSize: 17, fontWeight: '700', marginBottom: 4 },
@@ -459,43 +756,69 @@ const styles = StyleSheet.create({
   badgePending: { backgroundColor: 'rgba(232, 132, 92, 0.1)' },
   badgeDone: { backgroundColor: 'rgba(46, 204, 113, 0.1)' },
   badgeText: { fontSize: 10, fontWeight: '800', letterSpacing: 0.5 },
-  // Call Modal
+
+  // Modals
   modalOverlay: { flex: 1, backgroundColor: 'rgba(43, 122, 120, 0.4)', alignItems: 'center', justifyContent: 'center', padding: 24 },
   modalCard: {
-    backgroundColor: COLORS.card,
-    borderRadius: 28,
-    padding: 28,
-    width: '100%',
-    maxWidth: 380,
-    elevation: 12,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 10 },
-    shadowOpacity: 0.15,
-    shadowRadius: 25,
+    backgroundColor: COLORS.card, borderRadius: 28, padding: 28,
+    width: '100%', maxWidth: 380, elevation: 12,
+    shadowColor: '#000', shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.15, shadowRadius: 25,
   },
   modalTitle: { fontSize: 22, fontWeight: '800', color: COLORS.secondaryDark, textAlign: 'center', marginBottom: 8 },
-  modalSubtitle: { fontSize: 15, color: COLORS.textMuted, textAlign: 'center', marginBottom: 24 },
+  modalSubtitle: { fontSize: 15, color: COLORS.textMuted, textAlign: 'center', marginBottom: 24, lineHeight: 22 },
   contactBtn: {
-    backgroundColor: COLORS.dominant,
-    borderWidth: 0,
-    borderRadius: 18,
-    padding: 16,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 14,
-    marginBottom: 12,
+    backgroundColor: COLORS.dominant, borderWidth: 0, borderRadius: 18,
+    padding: 16, flexDirection: 'row', alignItems: 'center', gap: 14, marginBottom: 12,
   },
   contactAvatar: { width: 48, height: 48, borderRadius: 24, backgroundColor: COLORS.secondary, alignItems: 'center', justifyContent: 'center' },
   contactName: { color: COLORS.textMain, fontSize: 17, fontWeight: '700' },
   contactPhone: { color: COLORS.textMuted, fontSize: 14 },
   modalClose: {
-    alignItems: 'center',
-    paddingVertical: 16,
-    marginTop: 12,
-    borderWidth: 2,
-    borderColor: 'rgba(43, 122, 120, 0.2)',
+    alignItems: 'center', paddingVertical: 16, marginTop: 12,
+    borderWidth: 2, borderColor: 'rgba(43, 122, 120, 0.2)',
+    borderRadius: 16, backgroundColor: COLORS.card,
+  },
+
+  // Settings specific
+  inputLabel: {
+    color: COLORS.textSecondary,
+    fontSize: 14,
+    fontWeight: '700',
+    marginBottom: 8,
+    marginLeft: 4,
+  },
+  textInput: {
+    backgroundColor: COLORS.dominant,
     borderRadius: 16,
-    backgroundColor: COLORS.card,
+    padding: 16,
+    fontSize: 18,
+    fontWeight: '700',
+    color: COLORS.textMain,
+    borderWidth: 2,
+    borderColor: 'rgba(43, 122, 120, 0.15)',
+    marginBottom: 12,
+    textAlign: 'center',
+    letterSpacing: 1,
+  },
+  settingsHint: {
+    color: COLORS.textMuted,
+    fontSize: 13,
+    textAlign: 'center',
+    marginBottom: 20,
+    lineHeight: 20,
+  },
+  saveBtn: {
+    backgroundColor: COLORS.secondary,
+    borderRadius: 16,
+    padding: 16,
+    alignItems: 'center',
+    marginBottom: 8,
+    elevation: 4,
+  },
+  saveBtnText: {
+    color: 'white',
+    fontSize: 17,
+    fontWeight: '800',
   },
 });
-
