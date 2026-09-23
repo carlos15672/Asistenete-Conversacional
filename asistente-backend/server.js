@@ -4,11 +4,39 @@ const morgan = require('morgan');
 require('dotenv').config();
 const { GoogleGenAI } = require('@google/genai');
 const multer = require('multer');
+const googleTTS = require('google-tts-api');
 const sequelize = require('./models/database');
 const Reminder = require('./models/Reminder');
 
 const upload = multer({ storage: multer.memoryStorage() });
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+async function generateTTS(text) {
+  try {
+    if (!text) return null;
+    let cleanText = text.replace(/[*_#`]/g, '').trim();
+    if (cleanText.length > 190) {
+      const truncated = cleanText.slice(0, 190);
+      const lastPunct = Math.max(truncated.lastIndexOf('.'), truncated.lastIndexOf('!'), truncated.lastIndexOf('?'));
+      if (lastPunct > 50) {
+        cleanText = truncated.slice(0, lastPunct + 1);
+      } else {
+        const lastSpace = truncated.lastIndexOf(' ');
+        cleanText = (lastSpace > 50 ? truncated.slice(0, lastSpace) : truncated) + '.';
+      }
+    }
+    const base64 = await googleTTS.getAudioBase64(cleanText, {
+      lang: 'es',
+      slow: false,
+      host: 'https://translate.google.com',
+      timeout: 4000,
+    });
+    return base64;
+  } catch (err) {
+    console.error("TTS generation error:", err.message);
+    return null;
+  }
+}
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -122,7 +150,7 @@ app.delete('/api/reminders/:id', async (req, res) => {
   }
 });
 
-// Función auxiliar para procesar con Gemini
+// Función auxiliar para procesar con Gemini con timeout estricto
 async function processWithGemini(prompt, audioBuffer = null, mimeType = null) {
   const contents = [];
   if (audioBuffer) {
@@ -133,16 +161,13 @@ async function processWithGemini(prompt, audioBuffer = null, mimeType = null) {
       }
     });
   }
-  if (prompt) {
-    contents.push({ text: prompt });
-  }
 
-  // Verificar cooldown
+  // Cooldown mínimo de 300ms
   const now = Date.now();
-  if (now - lastGeminiCall < MIN_COOLDOWN_MS) {
-    return { action: "CONVERSATION", response: "Un momento, déjame pensar..." };
+  if (now - lastGeminiCall < 300) {
+    await new Promise(r => setTimeout(r, 300));
   }
-  lastGeminiCall = now;
+  lastGeminiCall = Date.now();
 
   // Obtener hora local con timezone
   const localNow = new Date();
@@ -151,38 +176,59 @@ async function processWithGemini(prompt, audioBuffer = null, mimeType = null) {
   const tzSign = tzOffset <= 0 ? '+' : '-';
   const localTimeStr = localNow.toLocaleString('es-MX', { dateStyle: 'full', timeStyle: 'short' });
 
-  const systemInstruction = `Eres un compañero cálido para adultos mayores solos. IMPORTANTE: Usa lenguaje neutro, NO asumas género. NO uses "amigo/amiga", "abuelito/abuelita", "cariño". En su lugar usa "qué gusto", "me alegra", "qué bueno", o tutéalo naturalmente. Responde en JSON: {"action":"CONVERSATION"|"CREATE_REMINDER"|"MARK_COMPLETED"|"GET_TIME"|"CLEAR_REMINDERS","response":"respuesta corta y cálida en español neutro","title":"..." (solo CREATE_REMINDER o MARK_COMPLETED),"time":"ISO8601 con zona horaria" (solo CREATE_REMINDER),"isCritical":bool (solo CREATE_REMINDER)}. HORA ACTUAL: ${localTimeStr} (UTC${tzSign}${tzHours}). Si dice "ya hice" o "ya tomé"->MARK_COMPLETED (incluye "title"). Si pide recordar->CREATE_REMINDER. Si pide hora->GET_TIME. Si dice "limpia/borra/elimina recordatorios"->CLEAR_REMINDERS. Si platica->CONVERSATION. Máximo 2 oraciones.`;
+  const instructionText = `Eres un asistente de voz cálido y muy conciso para adultos mayores. Escucha el audio o lee el texto del usuario.
+IMPORTANTE:
+- Responde en MÁXIMO 1 o 2 oraciones breves (máximo 20 palabras). Sé cálido pero neutro, no asumas género.
+- Si el audio está en silencio, solo contiene ruido de fondo o no se entiende voz clara, responde de inmediato: {"userSaid":"","action":"CONVERSATION","response":"No alcancé a escucharte bien, por favor acércate un poco más y repítemelo."}
+Responde estrictamente en JSON con este formato:
+{
+  "userSaid": "lo que dijo el usuario",
+  "action": "CONVERSATION" | "CREATE_REMINDER" | "MARK_COMPLETED" | "GET_TIME" | "CLEAR_REMINDERS",
+  "response": "respuesta corta y clara",
+  "title": "título corto si aplica",
+  "time": "ISO8601 con zona horaria si aplica",
+  "isCritical": false
+}
+HORA ACTUAL: ${localTimeStr} (UTC${tzSign}${tzHours}).
+${prompt ? `Texto del usuario: "${prompt}"` : ''}`;
 
-  let retries = 2;
-  while (retries > 0) {
+  contents.push({ text: instructionText });
+
+  // Usar gemini-3.5-flash-lite primero (procesa audio en ~1.2s sin encolarse)
+  const modelsToTry = ['gemini-3.5-flash-lite', 'gemini-flash-lite-latest'];
+  for (const modelName of modelsToTry) {
     try {
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.5-flash-lite',
-        contents: contents,
-        config: {
-          systemInstruction: systemInstruction,
-          responseMimeType: "application/json",
-          temperature: 0.5,
-          maxOutputTokens: 150,
-        }
-      });
+      const t0 = Date.now();
+      const response = await Promise.race([
+        ai.models.generateContent({
+          model: modelName,
+          contents: contents,
+          config: {
+            responseMimeType: "application/json",
+            temperature: 0.3,
+            maxOutputTokens: 120,
+          }
+        }),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error(`Timeout de 7000ms excedido`)), 7000)
+        )
+      ]);
+
+      const dt = Date.now() - t0;
+      console.log(`⚡ Gemini (${modelName}) respondió en ${dt}ms`);
       
       let text = response.text.trim();
-      // Si la IA se confunde y no regresa un JSON sino texto plano, lo convertimos manualmente
       if (!text.startsWith('{')) {
-        return { action: "CONVERSATION", response: text.replace(/`/g, '') };
+        return { action: "CONVERSATION", response: text.replace(/`/g, ''), userSaid: prompt || "Mensaje de voz" };
       }
       
       return JSON.parse(text);
     } catch (error) {
-      console.error(`Error en Gemini (intentos restantes: ${retries - 1}):`, error.message);
-      if (retries === 1) {
-        return { action: "CONVERSATION", response: "Me distraje un momento, ¿me lo repites por favor?" };
-      }
-      retries--;
-      await new Promise(res => setTimeout(res, 500)); // Esperar solo medio segundo
+      console.error(`⚠️ Advertencia en Gemini (${modelName}):`, error.message);
     }
   }
+
+  return { action: "CONVERSATION", response: "Te escuché un poco entrecortado, ¿me lo repites por favor?", userSaid: "" };
 }
 
 // Función auxiliar para ejecutar la acción en DB
@@ -239,18 +285,83 @@ app.post('/api/voice-command', async (req, res) => {
   const intent = await processWithGemini(text);
   await executeAction(intent);
 
-  res.json({ response: intent.response, action: intent.action });
+  const audioBase64 = await generateTTS(intent.response);
+  res.json({
+    response: intent.response,
+    action: intent.action,
+    userSaid: intent.userSaid || text,
+    audioBase64: audioBase64
+  });
 });
+
+// Función para detectar formato real de audio por magic bytes
+function detectAudioMime(buffer, fallbackMime = 'audio/webm') {
+  if (!buffer || buffer.length < 4) return fallbackMime;
+  if (buffer[0] === 0x1A && buffer[1] === 0x45 && buffer[2] === 0xDF && buffer[3] === 0xA3) {
+    return 'audio/webm';
+  }
+  if (buffer[0] === 0x52 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x46) {
+    return 'audio/wav';
+  }
+  if (buffer[0] === 0x4F && buffer[1] === 0x67 && buffer[2] === 0x67 && buffer[3] === 0x53) {
+    return 'audio/ogg';
+  }
+  if (buffer.length >= 12 && buffer.toString('ascii', 4, 8) === 'ftyp') {
+    return 'audio/mp4';
+  }
+  if ((buffer[0] === 0x49 && buffer[1] === 0x44 && buffer[2] === 0x33) ||
+      (buffer[0] === 0xFF && (buffer[1] & 0xE0) === 0xE0)) {
+    return 'audio/mp3';
+  }
+  if (fallbackMime && fallbackMime.startsWith('audio/')) {
+    return fallbackMime.split(';')[0];
+  }
+  return 'audio/webm';
+}
 
 // POST: Procesar comando de voz (Audio a Gemini)
 app.post('/api/voice-command-audio', upload.single('audio'), async (req, res) => {
-  console.log("🎤 Audio recibido");
-  if (!req.file) return res.status(400).json({ error: 'Audio no proporcionado' });
+  let audioBuffer;
+  let mimeType;
 
-  const intent = await processWithGemini(null, req.file.buffer, req.file.mimetype || 'audio/m4a');
+  // Soportar tanto FormData como JSON con base64 para evitar bugs en React Native
+  if (req.body && req.body.audioBase64) {
+    audioBuffer = Buffer.from(req.body.audioBase64, 'base64');
+    mimeType = req.body.mimeType || 'audio/m4a';
+  } else if (req.file) {
+    audioBuffer = req.file.buffer;
+    mimeType = (req.file.mimetype || 'audio/webm').split(';')[0];
+  } else {
+    return res.status(400).json({ error: 'Audio no proporcionado' });
+  }
+
+  mimeType = detectAudioMime(audioBuffer, mimeType);
+  console.log(`🎤 Audio recibido: ${audioBuffer.length} bytes, formato: ${mimeType}`);
+
+  // Validación de audio mínimo para evitar 400 Invalid Argument
+  if (!audioBuffer || audioBuffer.length < 1500) {
+    console.log("⚠️ Audio muy corto descartado.");
+    const shortResp = "El audio fue muy cortito. Toca el botón, habla lo que necesitas y vuelve a tocarlo para enviar.";
+    const audioBase64 = await generateTTS(shortResp);
+    return res.json({
+      response: shortResp,
+      userSaid: "",
+      action: "CONVERSATION",
+      audioBase64: audioBase64
+    });
+  }
+
+  const intent = await processWithGemini(null, audioBuffer, mimeType);
   await executeAction(intent);
 
-  res.json({ response: intent.response, action: intent.action });
+  console.log(`🗣️ Usuario dijo: "${intent.userSaid || ''}" -> Respuesta: "${intent.response}"`);
+  const audioBase64 = await generateTTS(intent.response);
+  res.json({
+    response: intent.response,
+    action: intent.action,
+    userSaid: intent.userSaid || '',
+    audioBase64: audioBase64
+  });
 });
 
 app.listen(PORT, () => {

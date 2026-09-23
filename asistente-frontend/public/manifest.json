@@ -1,0 +1,16 @@
+{
+  "name": "Asistente de Voz",
+  "short_name": "Asistente",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#120a21",
+  "theme_color": "#120a21",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "192x192 512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

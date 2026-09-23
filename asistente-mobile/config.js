@@ -1,7 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 const STORAGE_KEY = '@server_url';
-const DEFAULT_URL = 'http://192.168.0.11:3000/api';
+const DEFAULT_URL = 'http://192.168.0.8:3000/api';
 
 /**
  * Obtiene la URL del servidor guardada, o retorna la URL por defecto.
@@ -32,8 +32,12 @@ export async function setServerUrl(url) {
  * Construye la URL del servidor a partir de solo la IP.
  * @param {string} ip - Solo la IP (ej: 192.168.0.5)
  */
-export function buildApiUrl(ip) {
-  return `http://${ip.trim()}:3000/api`;
+export function buildApiUrl(input) {
+  const trimmed = input.trim();
+  if (trimmed.startsWith('http')) {
+    return trimmed.endsWith('/api') ? trimmed : `${trimmed}/api`;
+  }
+  return `http://${trimmed}:3000/api`;
 }
 
 export { DEFAULT_URL };
