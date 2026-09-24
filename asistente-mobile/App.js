@@ -10,6 +10,7 @@ import axios from 'axios';
 axios.defaults.headers.common['Bypass-Tunnel-Reminder'] = 'true';
 
 import { useAudioRecorder, RecordingPresets, AudioModule } from 'expo-audio';
+import { Audio } from 'expo-av';
 import * as Speech from 'expo-speech';
 import * as FileSystem from 'expo-file-system/legacy';
 import Svg, { Path } from 'react-native-svg';
@@ -139,13 +140,94 @@ export default function App() {
     }
   }, [micState]);
 
-  // ===== VOICE RECORDING WITH expo-audio =====
+  // ===== VOICE RECORDING & AUDIO PLAYBACK =====
   const autoStopTimer = useRef(null);
+  const currentSoundRef = useRef(null);
+
+  const stopAnyVoice = async () => {
+    try {
+      Speech.stop();
+      if (currentSoundRef.current) {
+        await currentSoundRef.current.stopAsync().catch(() => {});
+        await currentSoundRef.current.unloadAsync().catch(() => {});
+        currentSoundRef.current = null;
+      }
+    } catch {}
+  };
+
+  const playVoiceResponse = async (text, audioBase64) => {
+    await stopAnyVoice();
+
+    // Forzar salida por altavoz principal y permitir sonido en modo silencioso (iOS/Android)
+    try {
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: false,
+        playsInSilentModeIOS: true,
+        playThroughEarpieceAndroid: false, // Evita que se escuche solo por el auricular de llamadas
+        staysActiveInBackground: false,
+      });
+    } catch (e) {
+      console.log('Error configurando AudioMode:', e);
+    }
+
+    setMicState('speaking');
+
+    // 1. Intentar reproducir audio base64 de Google TTS (idéntico a la web)
+    if (audioBase64) {
+      try {
+        const fileUri = `${FileSystem.cacheDirectory}tts_${Date.now()}.mp3`;
+        await FileSystem.writeAsStringAsync(fileUri, audioBase64, {
+          encoding: FileSystem.EncodingType.Base64,
+        });
+
+        const { sound } = await Audio.Sound.createAsync(
+          { uri: fileUri },
+          { shouldPlay: true, volume: 1.0 }
+        );
+        currentSoundRef.current = sound;
+
+        sound.setOnPlaybackStatusUpdate((status) => {
+          if (status.didJustFinish || status.error) {
+            setMicState('idle');
+            sound.unloadAsync().catch(() => {});
+            currentSoundRef.current = null;
+          }
+        });
+        return;
+      } catch (audioErr) {
+        console.warn('Fallo al reproducir base64, usando síntesis Speech:', audioErr);
+      }
+    }
+
+    // 2. Fallback: síntesis nativa con idioma 'es' universal
+    try {
+      Speech.speak(text, {
+        language: 'es',
+        rate: 0.95,
+        pitch: 1.0,
+        onDone: () => setMicState('idle'),
+        onError: (e) => {
+          console.warn('Error en Speech.speak:', e);
+          setMicState('idle');
+        },
+      });
+    } catch (err) {
+      console.error('Error total en voz:', err);
+      setMicState('idle');
+    }
+  };
 
   const startRecording = async () => {
     try {
-      Speech.stop();
+      await stopAnyVoice();
       setAiResponse('');
+      try {
+        await Audio.setAudioModeAsync({
+          allowsRecordingIOS: true,
+          playsInSilentModeIOS: true,
+        });
+      } catch {}
+
       await recorder.prepareToRecordAsync();
       recorder.record();
       setMicState('listening');
@@ -197,13 +279,7 @@ export default function App() {
       setAiResponse(data.response);
 
       // Hablar la respuesta en voz alta
-      setMicState('speaking');
-      Speech.speak(data.response, {
-        language: 'es-MX',
-        rate: 1.0,
-        onDone: () => setMicState('idle'),
-        onError: () => setMicState('idle'),
-      });
+      await playVoiceResponse(data.response, data.audioBase64);
 
       // Refrescar recordatorios
       fetchNextReminder(apiUrl);
@@ -215,13 +291,7 @@ export default function App() {
         : 'No pude conectar con el servidor. Verifica que esté encendido y la IP sea correcta.';
 
       setAiResponse(errorMsg);
-      setMicState('speaking');
-      Speech.speak(errorMsg, {
-        language: 'es-MX',
-        rate: 1.0,
-        onDone: () => setMicState('idle'),
-        onError: () => setMicState('idle'),
-      });
+      await playVoiceResponse(errorMsg, null);
     }
   };
 
@@ -242,7 +312,7 @@ export default function App() {
       // Si toca antes de los 6 seg, enviar inmediatamente
       await stopAndSend();
     } else if (micState === 'speaking') {
-      Speech.stop();
+      await stopAnyVoice();
       setMicState('idle');
     }
     // Si está 'processing', no hacer nada
